@@ -64,9 +64,10 @@
 # RUNTIME. openSesame on 24 EPIC v2 arrays takes roughly 20 minutes. The
 # CellDMC permutation null (PART V) is the slow step: one genome-wide fit takes
 # about 8 minutes, so B = 1000 permutations is not feasible on a laptop. Set
-# RUN_PERMUTATION = FALSE to skip it, or run it on a cluster -- the loop
-# checkpoints every CHUNK iterations and resumes. A completed cluster run is
-# picked up automatically, before RUN_PERMUTATION is consulted, if
+# RUN_PERMUTATION = FALSE to skip it, or run it on a cluster with the scripts
+# in hpc/ (about 40 minutes across 20 array tasks). The local loop checkpoints
+# every CHUNK iterations and resumes. A completed cluster run is picked up
+# automatically, before RUN_PERMUTATION is consulted, if
 # analysis_output_v2/celldmc_IC_permutation_null_B1000_full.rds is present.
 # See PART V for details.
 #
@@ -3721,9 +3722,11 @@ saveRDS(obs_counts_s3, file.path(RDS_DIR, "celldmc_IC_observed_counts.rds"))
 # -----------------------------------------------------------------------------
 # RUNTIME. This reruns CellDMC genome-wide B times. At roughly 8 minutes per
 # fit, B = 1000 is not feasible on a laptop; the reported null was computed on
-# the UAMS Grace cluster with a 20-task SLURM array
-# (celldmc_permutation_grace.R / celldmc_perm_array.sbatch), and the merged
-# result was copied back to RDS_DIR.
+# the UAMS Grace cluster with a 20-task SLURM array. The scripts that did it
+# are in hpc/: celldmc_perm_array.sbatch submits the array,
+# celldmc_perm_array.R computes one slice, and celldmc_perm_combine.R merges
+# the slices and writes the summary. The merged result is copied back to
+# RDS_DIR, where the branch below picks it up.
 #
 # Behaviour:
 #   - if the cluster result is present in RDS_DIR, it is loaded and used;
@@ -3735,6 +3738,32 @@ saveRDS(obs_counts_s3, file.path(RDS_DIR, "celldmc_IC_observed_counts.rds"))
 RUN_PERMUTATION <- TRUE
 PERM_CORES      <- max(1L, parallel::detectCores() - 2L)
 CHUNK           <- 50
+
+# -----------------------------------------------------------------------------
+# Everything the cluster array needs, written where hpc/celldmc_perm_array.R
+# expects it. Writing this here rather than assembling it by hand is what makes
+# the cluster path reproducible: the observed counts travel with the data, so
+# the permutation null can never be anchored to counts from a different run.
+# -----------------------------------------------------------------------------
+perm_input_file <- file.path(RDS_DIR, "celldmc_perm_input.rds")
+saveRDS(list(beta_collapsed = beta_collapsed,
+             frac_cdmc      = frac_cdmc_s3,
+             ic_pheno       = ic_pheno_s3,
+             obs_counts     = obs_counts_s3,
+             fdr_thresh     = 0.05,
+             b_perm         = B_PERM,
+             seed           = 20260101,
+             rng_kind       = "L'Ecuyer-CMRG",
+             created        = format(Sys.time())),
+        perm_input_file)
+cat("Cluster input written to:", perm_input_file, "\n")
+cat("  To run the null on a cluster, copy it next to the scripts in hpc/ and\n")
+cat("  submit hpc/celldmc_perm_array.sbatch; see hpc/README section in README.md.\n")
+
+# The cluster array uses L'Ecuyer-CMRG so that forked workers get independent
+# substreams. Match it here, so permutation b is the same relabelling whether it
+# was computed locally or on the cluster, and slices from the two can be pooled.
+RNGkind("L'Ecuyer-CMRG")
 
 perm_cluster_file <- file.path(RDS_DIR,
                                "celldmc_IC_permutation_null_B1000_full.rds")
@@ -4086,6 +4115,34 @@ perm_row <- function(col, fmt = fmt_n) {
     v <- perm_summary_s3[[col]][perm_summary_s3$cell_type == ct]
     if (length(v) == 0) "\u2014" else fmt(v)
   }, character(1))
+}
+
+# The permutation null is the one object here that can arrive from a previous
+# run, so it is the one that can silently disagree with the counts computed in
+# THIS run -- which is exactly what happened before this guard existed: a null
+# computed against observed counts of 118 / 235 / 83 was reported alongside
+# freshly computed counts of 125 / 235 / 88, and the empirical p-values in
+# Table 6 were therefore measured against the wrong anchors. The stopifnot in
+# the cluster-load branch above covers only one of the ways perm_summary_s3 can
+# be populated; this covers all of them, at the point of use.
+if (!is.null(perm_summary_s3)) {
+  .anchor <- obs_counts_s3[perm_summary_s3$cell_type]
+  if (!isTRUE(all.equal(as.integer(perm_summary_s3$observed),
+                        as.integer(.anchor)))) {
+    stop("The permutation null was computed against different observed counts ",
+         "than this run produced.\n",
+         "  null was anchored to: ",
+         paste(sprintf("%s = %d", perm_summary_s3$cell_type,
+                       as.integer(perm_summary_s3$observed)), collapse = ", "),
+         "\n  this run computed:    ",
+         paste(sprintf("%s = %d", names(obs_counts_s3),
+                       as.integer(obs_counts_s3)), collapse = ", "),
+         "\n  The empirical p-values would be measured against the wrong ",
+         "counts.\n  Recompute the null, or recompute emp_p_value from ",
+         "perm_mat against the\n  current observed counts, before building ",
+         "Table 6.")
+  }
+  rm(.anchor)
 }
 
 table6_celldmc <- tibble(

@@ -8,7 +8,7 @@ Companion analysis code for:
 | | |
 |---|---|
 | Data | NCBI GEO [**GSE337899**](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE337899) |
-| Archived code | [10.5281/zenodo.21245950](https://doi.org/10.5281/zenodo.21245950) |
+| Archived code | [10.5281/zenodo.21245949](https://doi.org/10.5281/zenodo.21245949) |
 | Platform | Illumina Infinium MethylationEPIC v2.0 |
 | Specimens | 24 nasal brushings (21 PARDS, 3 control) |
 | Analysis | R 4.5.0 |
@@ -29,6 +29,8 @@ survives adjustment for it at this sample size.
 | `Methyl_PARDS_pipeline.R` | The complete analysis, raw iDATs to every reported figure and table. Runs start to finish. |
 | `make_supplemental_figure_1.py` | Generates Supplemental Figure 1 (enrollment flow chart), which is drawn rather than computed. |
 | `templates/unified_samplesheet_template.csv` | Sample sheet template: the exact header, plus two synthetic example rows to be replaced. |
+| `tools/reanchor_permutation_null.R` | Recomputes the CellDMC empirical p-values from a saved permutation matrix when the observed counts change, without re-running the null. |
+| `hpc/` | SLURM array job that computes the CellDMC permutation null, and the script that merges its output. |
 | `LICENSE` | MIT. |
 
 `Methyl_PARDS_pipeline.R` supersedes `Methyl_Revis_Master_Pub.R` from earlier commits.
@@ -82,8 +84,12 @@ Everything else — `figures_v2/`, `tables_v2/`, `logs_v2/`, `analysis_output_v2
 One row per specimen. `templates/unified_samplesheet_template.csv` carries the
 exact header; replace its two `EXAMPLE_` rows with your own.
 
-**What is and is not public.** The array data and the technical metadata in
-GSE337899 — specimen identifiers, group, Sentrix barcode and position — are
+**What is and is not public.** GSE337899 deposits the array data, the specimen
+identifier (as the sample description, e.g. `ARDS_001`) and the group (as the
+`condition` characteristic). The Sentrix barcode and position are not separate
+sample characteristics; they are encoded in the deposited iDAT filenames
+(`GSM9862480_207097430079_R01C01_Grn.idat.gz`), which is why the matcher below
+reads them from the filename. Together these are
 enough to reproduce quality control, probe filtering, deconvolution, composition
 adjustment, PCA, and clustering: Figures 1–5, Tables 2, 4, 5 and 7, and
 Supplemental Tables 2–8. The clinical variables contain protected health
@@ -209,6 +215,48 @@ single-threaded and is not a laptop job. Three ways through it:
 - Set `RUN_PERMUTATION <- FALSE` to skip it. Table 6 is then produced without the
   empirical p-values.
 
+### Running the null on a cluster
+
+The scripts in `hpc/` are the ones that produced the published null: a 20-task
+SLURM array, 50 permutations each, about 40 minutes wall-clock.
+
+```bash
+# 1. Run the pipeline far enough to write the input bundle (PART V writes it).
+#    It lands in analysis_output_v2/celldmc_perm_input.rds and carries the beta
+#    matrix, the compartment fractions, the phenotype vector, B, the seed, the
+#    RNG kind, the FDR threshold, and the observed counts.
+
+# 2. Copy it to the cluster, next to the hpc/ scripts.
+scp analysis_output_v2/celldmc_perm_input.rds cluster:~/celldmc/
+scp hpc/* cluster:~/celldmc/
+
+# 3. Submit. Edit the partition and the environment-activation block first.
+cd ~/celldmc && sbatch celldmc_perm_array.sbatch
+
+# 4. When the array finishes, merge.
+Rscript celldmc_perm_combine.R
+
+# 5. Copy the result back.
+scp cluster:~/celldmc/celldmc_IC_permutation_null_B1000_full.rds \
+    analysis_output_v2/
+```
+
+Every analytic parameter travels inside `celldmc_perm_input.rds` — nothing is
+set in the cluster scripts. A slice records the seed, RNG kind and B it ran
+under, and the merge step refuses to pool slices that disagree. `CELLDMC_WORK`
+sets the working directory; it defaults to the submission directory.
+
+Three settings in `celldmc_perm_array.sbatch` are site-specific and must be
+changed: the partition, the way the R environment is activated, and the
+resource requests.
+
+A saved null is anchored to the observed counts that existed when it was
+computed. If the observed counts later change, the null distribution stays valid
+but the empirical p-values do not — they are measured against the wrong
+observation. The pipeline now stops with an explicit message if it detects this.
+`tools/reanchor_permutation_null.R` recomputes the p-values exactly from the
+stored permutation matrix, in seconds, rather than repeating the 1,000 fits.
+
 ---
 
 ## Outputs, and where each appears in the manuscript
@@ -296,4 +344,4 @@ returned for the EPIC v2 platform, so no specimen was ever evaluated against
 ## Citation
 
 Please cite the manuscript and the GEO accession GSE337899. For the code
-specifically, cite the archived release: [10.5281/zenodo.21245950](https://doi.org/10.5281/zenodo.21245950).
+specifically, cite the archived release: [10.5281/zenodo.21245949](https://doi.org/10.5281/zenodo.21245949).
